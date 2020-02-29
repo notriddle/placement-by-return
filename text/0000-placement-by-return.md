@@ -6,7 +6,7 @@
 # Summary
 [summary]: #summary
 
-Implement ["placement"](https://internals.rust-lang.org/t/removal-of-all-unstable-placement-features/7223) with no new syntax, by extending the existing capabilities of ordinary `return`. This involves [copying Guaranteed Copy Elision rules pretty much wholesale from C++17](https://jonasdevlieghere.com/guaranteed-copy-elision/), adding functions like `fn new_with<F: FnOnce() -> T, T: ?Sized>(f: F) -> Self` to Box and `fn push_with<F: FnOnce() -> T>(&mut self, f: F)` to Vec to allow performing the allocation before evaluating F, providing raw access to the return slot for functions as an unsafe feature, and allowing unsized object to be returned directly by compiling such functions into a special kind of "generator."
+Implement ["placement"](https://internals.rust-lang.org/t/removal-of-all-unstable-placement-features/7223) with no new syntax, by extending the existing capabilities of ordinary `return`. This involves [copying Guaranteed Copy Elision rules pretty much wholesale from C++17](https://jonasdevlieghere.com/guaranteed-copy-elision/), adding functions like `fn new_with<F: FnOnce() -> T, T: ?Sized>(f: F) -> Self` to Box and `fn push_with<F: FnOnce() -> T>(&mut self, f: F)` to Vec to allow performing the allocation before evaluating F, providing raw access to the return slot for functions as an unsafe feature, and allowing functions to directly return **Dynamically-Sized Types** (DSTs) by compiling such functions into a special kind of "generator".
 
 Starting with the questions given at the end of the [old RFC's mortician's note](https://github.com/rust-lang/rust/issues/27779):
 
@@ -18,11 +18,11 @@ Starting with the questions given at the end of the [old RFC's mortician's note]
 # Motivation
 [motivation]: #motivation
 
-Rust has a dysfunctional relationship with objects that are large or variable in size. It can accept them as parameters pretty well using references, but creating them is horrible:
+Rust has a dysfunctional relationship with objects that are large or variable in size. It can accept them as parameters pretty well using references, but creating them is unwieldy and inneficient:
 
 * A function pretty much has to use `Vec` to create huge arrays, even if the array is fixed size. The way you'd want to do it, `Box::new([0; 1_000_000])`, will allocate the array on the stack and then copy it into the Box. This same form of copying shows up in tons of API's, like serde's Serialize trait.
-* There's no safe way to create gigantic, singular structs at all. If your 1M array is wrapped somehow, you pretty much have to allocate the memory by hand and transmute.
-* You can't return bare unsized types. [You can create them locally, and you can pass them as arguments](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md), but not return them.
+* There's no safe way to create gigantic, singular structs without overhead. If your 1M array is wrapped somehow, you pretty much have to allocate the memory by hand and transmute.
+* You can't return bare unsized types. [RFC-1909](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md) allows you to create them locally, and pass them as arguments, but not return them.
 
 As far as existing emplacement proposals go, this one was written with the following requirements in mind:
 
@@ -44,7 +44,7 @@ let boxed_data_struct = Box::new_with(DataStruct::new); // instead of Box::new(D
 
 The `new_with` function will perform the allocation first, then evaluate the closure, placing the result directly within it. The `new` function, on the other hand, evaluates the argument *then* performs the allocation and copies the value into it.
 
-A similar function exist for Vec and other data structures, with names like `push_with` and `insert_with`.
+Similar functions exist for Vec and other data structures, with names like `push_with` and `insert_with`.
 
 When writing constructors, you should create large data structures directly on the return line. For example:
 
@@ -66,8 +66,8 @@ fn bad() -> [i32; 1_000_000] {
     }
     arr
 }
-// This function will compile successfully, but it will allocate the array on the stack,
-// which is probably very bad.
+// This function will compile successfully with #![feature(unsized_locals)]
+// but it will allocate the array on the stack, which is probably very bad.
 fn bad_dst() {
     fn takes_dst(_k: [i32]) {}
     fn returns_dst() -> [i32] { let n = 1_000_000; [1; n] }
@@ -127,7 +127,7 @@ fn not_bad() -> [i32] {
 
 ## Did you say I can return unsized types?
 
-A function that directly returns an unsized type should be compiled into two functions, essentially as a special kind of generator. Like this, basically:
+A function that directly returns an unsized type should be compiled into two functions, essentially as a special kind of generator:
 
 ```rust
 // sugar
@@ -138,6 +138,7 @@ fn function_that_calls_my_function() -> str {
     println!("Hi there!");
     my_function()
 }
+
 // desugar my_function
 // this is written in order to aid understanding, not because these are good APIs
 use std::alloc::Layout;
@@ -161,6 +162,7 @@ impl __MyFunction__Internal {
     str::from_raw_parts_mut(slot, state.local_0.len())
   }
 }
+
 // desugar function_that_calls_my_function
 use std::alloc::Layout;
 struct __FunctionThatCallsMyFunction__Internal {
@@ -183,8 +185,8 @@ This interface ends up putting some pretty harsh limitations on what functions t
 
 * Constants and dereferencing constants (as shown above). These are desugared by yielding the layout of the literal and returning the literal by copying it.
 * Directly returning the value of another function that also returns the same unsized type. These are desugared by forwarding, as shown above with `function_that_calls_my_function`.
-* [RFC 1909](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md) variable-length array literals. These are desugared by yielding the length variable, and returned by writing the value repeatedly though ptr offsets and ptr write.
-* Unsized coersions. These are desugared by storing the sized type as function state, yielding the layout of the sized type, and returning by copying.
+* Variable-length array literals, similar to those in [RFC 1909](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md). These are desugared by yielding the length variable, then returning the payload through ptr offsets and ptr writes.
+* Unsized coercions. These are desugared by storing the sized type as function state, yielding the layout of the sized type, and returning by copying.
 * Blocks, unsafe blocks, and branches that have acceptable expressions in their tail position.
 
 As is typical for generators, these functions may need to be desugared into simple "state machines" if they return branches or have more than one exit point.
@@ -206,6 +208,7 @@ fn with_multiple_exit_points() -> [i32] {
     let n = 100;
     [1; n] // returning variable-length-array expression
 }
+
 // desugar with_branch
 // this is written in order to aid understanding, not because these are good APIs
 use std::alloc::Layout;
@@ -236,6 +239,7 @@ impl __WithBranch__Internal {
     }
   }
 }
+
 // desugar with_multiple_exit_points
 enum __WithMultipleExitPoints__Internal {
   S0(&[i32]),
@@ -271,28 +275,6 @@ impl __WithMultipleExitPoints__Internal {
 }
 ```
 
-Important point: returning unsized variables is not allowed.
-
-```rust
-// fn invalid() -> [i32] {
-//     let n = 100;
-//     let k = [1; n];
-//     k // ERROR: cannot return unsized variable
-// }
-```
-
-This is because there's no way to break all such functions in half the way we need to. Where would we put `k` between the calls to `start()` and the call to `finish()`? We can't just put it in the struct, because we need to know how big a generator's stack frames will be in order to generate its state machine struct.
-
-On the other hand, a function that returns an unsized value can have its return value assigned to a
-local variable (the compiler will `start()` the function to get a layout for it, then `alloca()` the space, then `finish()` the function into that space). This is a natural thing to support, and it's great for trait objects, but it's probably a horrible idea to do it with dynamically-sized slices, and should be linted against.
-
-```rust
-fn valid_but_terrible() {
-    let n: [i32] = returns_slice();
-    takes_slice(n);
-}
-```
-
 ## How this works with sized types
 
 Any function that returns a sized type can be trivially adapted to the "unsized return generator" interface of `start()` and `finish()`, by having start return a constant and have finish do all the work.
@@ -302,6 +284,7 @@ fn return_a_sized_value() -> i32 {
     println!("got random value");
     4 // determined by a fair dice roll
 }
+
 // desugar return_a_sized_value
 // this is written in order to aid understanding, not because these are good APIs
 use std::alloc::Layout;
@@ -324,13 +307,23 @@ This is how it would conceptually work whenever a facility designed to handle pl
 
 ## Absolutely minimum viable copy elision
 
-To make sure this functionality is useful for sized types, we should probably also guarantee some amount of copy elision:
+To make sure this functionality can be used with no overhead, the language should guarantee some amount of copy elision. The following operations should be guaranteed zero-copy:
 
 * Directly returning the result of another function that also returns the same type.
 * Blocks, unsafe blocks, and branches that have acceptable expressions in their tail position.
-* Struct and array literals.
+* Array and struct literals, including struct literals ending with an unsized value.
 
-The first two cases are chosen as "must-have" copy elision because they allow functions that use the unsafe methods to be composed with other functions without introducing overhead. The last rule is added because it's trivial to guarantee, and because the line between "tuple struct literal" and "function call" is blurry anyway.
+These operations are "must-have" copy elision because they allow functions returning unsized types through unsafe methods to be composed with other functions without introducing overhead.
+
+In the case of array and struct literals, the copy elision must be recursive. For example:
+
+```rust
+fn no_copy() -> Struct2 {
+    Struct2 { member: Struct { member: getData() } }
+}
+```
+
+In the above example, the data returned by `getData()` may be sized or unsized. Either way, it should not be copied at all (aside from its initial creation), whether when constructing the Struct, the Struct2, or returning the data.
 
 Guaranteed Copy Elision only kicks in when a GCE-applicable expression is directly returned from a function, either by being the function's last expression or by being the expression part of a `return` statement.
 
@@ -363,29 +356,19 @@ If allocation fails, `write_return_with` may panic without calling `f`. The retu
 
 IMPORTANT IMPLEMENTATION NOTE: Because of the way unsized return generators are codegenned as generators, it would be possible to tell that `write_unsized_return_with` wasn't actually panicking by wrapping its invocation in `catch_panic`. To ensure the user cannot do this, the closure passed to `catch_panic` must return a sized type; we still technically won't be unwinding through their stack frames, but we will be calling the drop functions with `is_panicking` set to true, so they won't be able to tell. Additionally, of course, the return slot for sized types is always pre-allocated, so this function will never panic in that case.
 
-#### Example: raw_as_bytes_with
+#### Example: zeroed_array
 
 ```rust
-mod str {
-  /// This is a function adapter. Usage:
-  ///
-  ///     fn get_str() -> str;
-  ///     let get_bytes = str::raw_as_bytes_with(get_str);
-  ///     get_bytes()
-  pub fn raw_as_bytes_with<Args, F: FnOnce<Args, Output=str>>(f: F) -> impl FnOnce<Args, Output=[u8]> {
-    unsafe {
-      struct ConvertFn<F>(F);
-      impl<Args, F: FnOnce<Args, Output=str>> FnOnce<Args> for ConvertFn<F> {
-        type Output = [u8];
-        fn call(self, a: Args) -> [u8] {
-          let finish = read_unsized_return_with(|| self.0.call(a));
-          write_unsized_return_with(
-            finish.layout(),
-            |slot: &mut MaybeUninit<[u8]>| finish.finish(MaybeUninit::from_mut_ptr(slot.as_mut_ptr() as *mut str))) as *mut str as *mut [u8] as &mut [u8]
-        }
-      }
-    }
-  }
+unsafe fn zeroed_array<T>(n: usize) -> [T] {
+    let (array_layout, _) = Layout::new::<T>().repeat(n).unwrap();
+    write_unsized_return_with(
+        array_layout,
+        |slot: *mut u8| {
+            for i in 0 .. size_of::<T>() {
+                *slot.offset(i) = 0;
+            }
+        },
+    )
 }
 ```
 
@@ -454,7 +437,6 @@ impl<T> Vec<T> {
     pub fn extend_from_raw_slice_with<F: FnOnce() -> [T]>(&mut self, f: F) {
         let finish = read_unsized_return_with(f);
         let layout = finish.layout();
-        debug_assert_eq!(layout.size() % size_of::<T>(), 0);
         debug_assert_eq!(layout.align(), align_of::<T>());
         let count = layout.size() / size_of::<T>();
         self.0.reserve(count);
@@ -464,6 +446,32 @@ impl<T> Vec<T> {
         debug_assert!(slice.len() <= count);
         self.set_len(self.len() + slice.len());
     }
+}
+```
+
+#### Example: raw_as_bytes_with
+
+```rust
+mod str {
+  /// This is a function adapter. Usage:
+  ///
+  ///     fn get_str() -> str;
+  ///     let get_bytes = str::raw_as_bytes_with(get_str);
+  ///     get_bytes()
+  pub fn raw_as_bytes_with<Args, F: FnOnce<Args, Output=str>>(f: F) -> impl FnOnce<Args, Output=[u8]> {
+    unsafe {
+      struct ConvertFn<F>(F);
+      impl<Args, F: FnOnce<Args, Output=str>> FnOnce<Args> for ConvertFn<F> {
+        type Output = [u8];
+        fn call(self, a: Args) -> [u8] {
+          let finish = read_unsized_return_with(|| self.0.call(a));
+          write_unsized_return_with(
+            finish.layout(),
+            |slot: &mut MaybeUninit<[u8]>| finish.finish(MaybeUninit::from_mut_ptr(slot.as_mut_ptr() as *mut str))) as *mut str as *mut [u8] as &mut [u8]
+        }
+      }
+    }
+  }
 }
 ```
 
@@ -566,9 +574,9 @@ The biggest issue with Guaranteed Copy Elision is that it's actually kind of har
 
 There have also been people recommending a more do-what-I-mean approach where `Box::new(f())` is guaranteed to perform copy elision. That would induce the absolute minimal churn, though how you'd handle intermediate functions like `fn foo(t: T) { box::new(t) }` is beyond me.
 
-The third drawback, and I personally think this is the *worst* drawback, is that it's invisible. This means that when a user accidentally writes code that is performs copies, it isn't always obvious that they messed up. There isn't any way to get existing code to achieve GCE without making it invisible, and I wanted to avoid churn in everyone's `new()` functions, as described in [rationale-and-alternatives]. Presumably, it can be solved using optional [lints].
+The third drawback, and I personally think this is the *worst* drawback, is that it's invisible. This means that when a user accidentally writes code that performs copies, it isn't always obvious that they messed up. There isn't any way to get existing code to achieve GCE without making it invisible, and I wanted to avoid churn in everyone's `new()` functions, as described in [rationale-and-alternatives]. Presumably, it can be solved using optional [lints].
 
-Another major drawback is that it doesn't compose well with pattern matching (or `?`). Imagine you have a function `fn foo() -> Result<Struct, Error>` and you want to do something like `Box::new(foo()?)`, but you want to directly place it. This is impossible; not just because with closures `Box::new_with(|| foo()?)` won't do what you want, but any system where the function being called writes its entire result through a pointer (like the old Placer proposal) cannot have the function being called write part of its result in one place (the `Ok` value should be written into the `Box<Struct>`) while other parts are written in other places (the discriminator should be written to a slot on the stack, since there isn't room for it). You can only assemble a `Box<Result<Struct, Error>>`, or abandon Result entirely and use an error handler callback or a panic/catch.
+Another major drawback is that it doesn't compose well with pattern matching (or `?`). Imagine you have a function `fn foo() -> Result<Struct, Error>` and you want to do something like `Box::new(foo()?)`, but you want to directly place it. This is impossible; not just because with closures `Box::new_with(|| foo()?)` won't do what you want, but any system where the function being called writes its entire return through a pointer cannot handle cases where the return is wrapped in a larger object (eg a Result). See [returning-unsized-results] for details.
 
 Also, like all placement proposals, it involves adding a new API surface area to most of the built-in data structures. Since there are known problems with how this proposal works with error handling, the GCE-based version may end up being replaced with an approach that does.
 
@@ -579,9 +587,9 @@ Additionally, this proposal deliberately does not implement NRVO. This means peo
 
 ## Why not use an alternative ABI for returning Result?
 
-The biggest drawback to this proposal, like most placement proposals, is that it works poorly with Result. You can emplace a function returning `Result<T>` into a `Box<Result<T>>`, and you cannot emplace it into a `Box<T>`. Making this work would require the inner payload to be written to the box, while the tag is written to somewhere on the stack.
+The biggest drawback to this proposal, like most placement proposals, is that it works poorly with Result. You can emplace a function returning `Result<T>` into a `Box<Result<T>>`, and you cannot emplace it into a `Box<T>`.
 
-This proposal does not define an alternative ABI for results because it would be work poorly with `read_return_with` and `write_return_with`. Both of these functions expose the return slot as a raw pointer, which means the return slot has to be in a continuous region of memory. This proposal does not, strictly speaking, lock out alternative ABIs for Result, but it does impose copying whenever such ABIs are used along with the `return_with` functions. These functions have to work with results, because they have to work in generic contexts.
+This proposal does not define an alternative ABI for results because it would be work poorly with `read_return_with` and `write_return_with`. Both of these functions expose the return slot as a raw pointer, which means the return slot has to be in a continuous region of memory. This proposal does not, strictly speaking, lock out alternative ABIs for Result, but any such ABI would need to solve the design problems described in the [future-possibilities] section.
 
 Using an alternative ABI remains practical as a solution for the "peanut butter" conditional cost (the `return_with` functions will be rarely used in most Rust code, especially when the code is just propogating error flags), but the way these functions work precludes using an alternative ABI as a solution for placement.
 
@@ -590,21 +598,21 @@ Using an alternative ABI remains practical as a solution for the "peanut butter"
 [The previous emplacement RFC was rejected for the following reasons](https://github.com/rust-lang/rust/issues/27779#issuecomment-378416911), most of which this new RFC addresses:
 
 * The implementation does not fulfil the design goals
-  
+
     * Place an object at a specific address
-  
+
       This is literally what `read_return_with` does.
-    
+
     * Allocate objects in arenas (references the original C++ goals)
 
       This is what `new_with` and related functions achieve.
-    
+
     * Be competitive with the implementation in C++
-  
+
       Passing a closure is essentially the same thing as passing an initializer list, so it should have the same performance as C++ emplacement.
 
  * The functionality of placement is unpredictable
- 
+
    This is probably the least-well-addressed concern. This RFC spends a lot of its text spelling out when GCE can kick in, which means it should be possible for a coder (or a lint) to tell whether a value is being copied or not, but it's still invisible.
 
    The other way it tries to address predictability is by offering the explicit-mode `write_return_with` intrinsic. Unfortunately, it's unsafe.
@@ -613,7 +621,7 @@ Using an alternative ABI remains practical as a solution for the "peanut butter"
 
     * make placement work with fallible creation
 
-      This RFC honestly has terrible support for this, mostly because it's painted itself into a corner. The sized-value-returning functions all have to be emplaceable, and when they return a Result, they return it by writing it directly through a pointer all at once. Making placement work really well with fallible creation rould require the Result to be split up, with the discriminant going into a stack frame or something, while the payload goes into the allocated area.
+      This RFC honestly has terrible support for this, mostly because it's painted itself into a corner. The sized-value-returning functions all have to be emplaceable, and when they return a Result, they return it by writing it directly through a pointer all at once.
 
     * trait design
 
@@ -652,12 +660,12 @@ This RFC supports returning DSTs for two reasons:
 * It allows emplacing dynamic byte blobs, which is really important for use cases like Mio and Serde.
 * It is one of the main requirements set out in the older RFC's mortician's note.
 
-The specific design for DST returning is, of course, optimized for emplacement, and the main use case is for emplacing big byte blobs. It supports returning trait objects as well, but that's not really what it's for, and it kind of shows. A proposal using implicit boxing would be more useful for such a case, though at that point it seems unnecessary (if you're given a function that returns a bare trait object, you can call it with `Box::new_with` and get on with your life).
+The specific design for DST returning is, of course, optimized for emplacement, and the main use case is for emplacing big byte blobs. It supports returning trait objects as well, but that's not really what it's for, and it kind of shows. The macros described in [future-possibilities] for implicit emplacement could help cover that use case.
 
 # Prior art
 [prior-art]: #prior-art
 
-Any place where my proposal is ambiguous? Let me know and I'll try to make it [the same as C++17 Guaranteed Copy Elision](https://jonasdevlieghere.com/guaranteed-copy-elision/).
+Any place where this proposal is ambiguous? Let me know and I'll try to make it [the same as C++17 Guaranteed Copy Elision](https://jonasdevlieghere.com/guaranteed-copy-elision/).
 
 It was after I came up with the idea that I realized `write_return_with` is basically a feature in the Go language, but Go has dedicated syntax for it and zero-initializes the return slot. I don't know of any prior art for `read_return_with`; it's not really all that similar to "placement new", even though it's arguably achieving the same goal.
 
@@ -691,19 +699,7 @@ Additionally, a few much-simpler lints can push users in the direction of gettin
 
 While this RFC specifies a bunch of cases where existing containers should incorporate `read_unsized_return_with` to allow in-place construction of container members, it doesn't specify any built-in functions that should use `write_(unsized_)return_with` exclusively.
 
-Functions which return potentially-large data structures that they construct will probably wind up using it. For example, `std::mem::zeroed` can be implemented like this:
-
-```rust
-unsafe fn zeroed<T>() -> T {
-    write_return_with(|slot: *mut u8| {
-        for i in 0 .. size_of::<T>() {
-            *slot.offset(i) = 0;
-        }
-    });
-}
-```
-
-Once type-level integers are provided, a function for constructing arrays in-place would also be possible:
+Functions which return potentially-large data structures that they construct will probably wind up using it. For example, once type-level integers are provided, a function for constructing arrays in-place would be possible:
 
 ```rust
 fn fill_array<T, F: Fn() -> T, const N: usize>(f: F) -> [T; N] {
@@ -719,6 +715,7 @@ fn fill_array<T, F: Fn() -> T, const N: usize>(f: F) -> [T; N] {
         });
     }
 }
+
 // This struct is used to take care of freeing the already-created items
 // in case `f` panics in the middle of filling the array.
 struct Filled<T>(*mut T, *mut T);
@@ -732,13 +729,101 @@ impl<T> Drop for Filled<T> {
 }
 ```
 
+## Synergy with RFC-1909
+
+This proposal was written to be independent from
+[RFC-1909 (unsized rvalues)](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md).
+
+While the two proposals cover similar concepts (directly manipulating unsized types), they're mostly orthogonal in implementation. RFC-1909 is about using alloca to allow unsized types in function parameters and locals, and explicitly excludes function returns. This proposal is about emplacement, which doesn't require `alloca`, can be done exclusively through interfaces like `Box::new_with`.
+
+In fact, even if both RFCs were implemented and standardized, it's not clear whether unsized returns should be allowed to be implicitly stored in locals using `alloca`. This is because `alloca` always grows the stack size without reusing existing memory, which means that any code creating locals of generic types in a loop would lead excessive stack sizes when called with an unsized type, in a way that isn't clear when looking at the offending code alone.
+
+Moreover, functions returning unsized types wouldn't be allowed to store them in locals:
+
+```rust
+// fn invalid() -> [i32] {
+//     let n = 100;
+//     let k = [1; n];
+//     k // ERROR: cannot return unsized variable
+// }
+```
+
+This is because `invalid()` is implicitly compiled into a generator; the compiler must generate a state machine struct to store its state between the call to `start()` and the call to `finish()`. Since k is stored in `alloca()`-created space, it can't be stored in a fixed-size state machine.
+
+On the other hand, storing a function's unsized return into a unsized local may be useful for some cases, such as trait objects. (though the concerns about implicit `alloca()` calls still apply).
+
+However, doing so with a dynamically-sized slices would create a serious performance risk, and should at least be linted against.
+
+```rust
+fn valid_but_terrible() {
+    let n: [i32] = returns_slice();
+    takes_slice(n);
+}
+```
+
+## New macros for implicit emplacement
+
+The new methods proposed in this RFC are explicitly opt-in. The user chooses to call `Box::new_with(|| getActualData(...))` instead of `Box::new(getActualData(...))`. This syntax has a few drawbacks: it's verbose, it's explicit for someone skimming the code, and since it's not the default syntax, developers are likely not to use it unless they absolutely need to, even in cases where it could help performance.
+
+A mitigation might be to add `box!`, `rc!`, `arc!` (and so on) macros to construct these types of object, similarly to existing `vec!` macro.
+
+The idea being that the macro would do the work of chosing whether to use the "construct then copy" variant or the "emplace" variant. New developers would just be told to use `rc!(my_data)` without having to worry about which variant is used.
+
+## Returning unsized Results
+[returning-unsized-results]: #Returning-unsized-Results
+
+This RFC's biggest drawback is its inability to handle faillible emplacement.
+
+As mentionned above, the syntax `Box::new_with(|| foo()?)` wouldn't be applicable, even disregarding layout problems. Most likely, special-case methods would have to be added (eg `<doTheThing>_with_result`), so that the final syntax would look like:
+
+```rust
+let my_box : Box<[i32]> = Box::new_with_result(|| foo())?;
+```
+
+However, there are several obstacles to this syntax:
+
+- It would require establishing a representation for DSTs wrapped in enums. Currently the only way to make a custom DST is to add another DST at the end of a struct.
+
+  There is no way to do the same with an enum; if we wanted to implement that feature, we would need to establish semantics for how these enums interact with the rest of the language. These semantics are beyond the scope of this RFC.
+
+- A `new_with_result` is only possible if the function can internally allocate enough memory to store a result, while only keeping the range of memory storing the payload at the end of the call, discarding the discriminant and the error (and accounting for cases where the err variant of the Result is much heavier than the ok variant).
+
+  While this is feasible with Box or Rc (which could, for instance, always allocate extraneous bytes before their stored data to accomodate the discriminant), it's harder for methods such as `Vec::push_with`, which require working on contiguous memory.
+
+There are several potential solutions to the second problem, though they all require language-wide changes, which are beyond the scope of this RFC.
+
+### Split the discriminant from the payload
+
+We could decide that enums (or at least a specific subset of enums, including Result, Option, and other specialized types) should be stored differently.
+
+Instead of storying the discriminant next to the payload, it would always be stored separately, eg in a register. References to these enums would be fat pointers, with the first word pointing to the payload, and the second word storying the discriminant.
+
+Functions returning results could then store their payload in the return slot, while returning the discriminant directly a register.
+
+We could even pass multiple return slots; for instance, if a function returns a Result, we could pass one return slot for the ok variant and another for the err variant.
+
+Of course, this semantic change would be far-reaching, and break backwards compatibility. Among other things, it would severely impact how Results and Options and similar types are stored in containers. This feature would probably require an edition change to be even considered (though edition changes don't apply to the standard library).
+
+### Always store the discriminant as a suffix
+
+We could add a guarantee that any enum of the form `Result<SomeData, Err>`, when set to its `Ok` variant, has to start with a valid representation of `SomeData`; with that rule, casting a pointer to a result to a pointer to its payload is always a no-op.
+
+This is already the case for some types where the discriminant is implicit (eg `Option<Box<i32>>`), but it could be generalized by requiring that the determinant, if not elided, must aways be stored after the payload, even for unsized types.
+
+This solution would make it possible to adapt methods like `Vec::push_with`, `Vec::extend_from_raw_slice_with`, where data is always appended to the end of contiguous memory and allocated data past the size of the added element can be written to, without overwriting existing objects.
+
+It would not work with methods such as `Vec::insert_with`, except in special cases where the Result is known to have the same memory layout as its payload (eg `Result<Box<i32>, ()>`).
+
+This solution would incur additional cache inefficiency (imagine a Result where the discriminant is stored after 10 mB of payload), though this isn't something average users would need to be worry about, and there would be easy mitigations for those who do.
+
+
 ## Integration with futures, streams, serde, and other I/O stuff
 
-It's an annoying fact that this RFC does not compose terribly well with `Result`, `Option`, or other pattern-matching constructs, specifically because it's not possible to write the value and the discriminator to separate parts of memory (ideally, the error flags would be written to a stack variable or register somewhere, while the data would be written directly to the heap- or kernel-backed buffer somewhere). `Future` and `Stream`, in particular, wraps the result of polling in the `Poll` enum, so while it's certainly possible to allocate such a result into a `Box<Poll<T>>` without copying, its not possible to get a `Box<T>` without copying given the existing futures API.
+This RFC does not compose terribly well with `Result`, `Option`, and other pattern-matching constructs; this makes it hard to use with async APIs. `Future` and `Stream`, in particular, wraps the result of polling in the `Poll` enum, so while it's certainly possible to allocate such a result into a `Box<Poll<T>>` without copying, its not possible to get a `Box<T>` without copying given the existing futures API.
 
 Mapping doesn't work, either, because it will pass the payload of a future as a parameter, which means that futures have to allocate storage for their contents. Sized types work as usual, and `Future<[u8]>` would wind up allocating stack space for the byte blob in order to pass it to the mapping function as a move-ref, as described in [RFC 1901 "unsized rvalues"](https://github.com/rust-lang/rfcs/blob/master/text/1909-unsized-rvalues.md).
 
-The only real option for handling zero-copy data, in any of these cases, is to build these things with errors treated as side-channels. None of this is hard, but it is annoying and not very dataflow-y. It's largely inherent to the goal of having zero-copy I/O while the type system doesn't support keeping pattern-matching semantics orthogonal to memory representation.
+Until unsized Results are implemented, the only real option for zero-copy data handling, in any of these cases, is to write functions with errors treated as side-channels. None of this is hard, but it is annoying and not very dataflow-y. It's largely inherent to the goal of having zero-copy I/O while the type system doesn't support keeping pattern-matching semantics orthogonal to memory representation.
 
 ```rust
 trait Read {
@@ -782,10 +867,6 @@ trait Read {
     }
 }
 ```
-
-The default implementation is kind of dumb, but a properly specialized implementation would be able to know how big its buffer should be instead of requiring the caller to guess (or use something like fstat to communicate to the caller manually), and allowing you to read directly into buffers without those buffers being able to give you an `&mut [u8]`,
-like the internal buffers maintained by Serde or Tokio. Additionally, because the Read implementation can request a buffer,
-scribble all over it, and then return an error anyhow, it's much better doing it this way than by returning a Result anyway.
 
 Presumably, the asynchronous systems could yield non-blocking Read implementations as streams or futures,
 but, based on [previous discussion of what a good I/O abstraction would be](https://users.rust-lang.org/t/towards-a-more-perfect-rustio/18570), we probably want to avoid using a get-a-byte abstraction for everything.
@@ -843,4 +924,3 @@ trait Serializer {
   }
 }
 ```
-
